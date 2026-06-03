@@ -206,7 +206,7 @@ def _render_plot(df: pd.DataFrame, spec: Dict[str, str]):
 
 def render_kpi_visual_tab():
     st.subheader("NLP KPI to Visuals")
-    st.caption("Enter KPI requests in natural language, generate chart specs, then preview using a CSV file.")
+    st.caption("Enter KPI requests in natural language, generate chart specs, then preview using a CSV or Excel file.")
 
     aliases = sorted(st.session_state.get("datasets", {}).keys())
     dataset_cols = st.session_state.get("dataset_cols", {})
@@ -272,16 +272,21 @@ def render_kpi_visual_tab():
 
     st.divider()
     st.markdown("### Preview generated visuals")
-    uploaded = st.file_uploader("Upload CSV for KPI visual preview", type=["csv"], key="kpi_visual_csv")
+    uploaded = st.file_uploader("Upload CSV or Excel for KPI visual preview", type=["csv", "xlsx"], key="kpi_visual_csv")
     if not uploaded:
-        st.caption("Upload a CSV to render the visuals above.")
+        st.caption("Upload a CSV or Excel file to render the visuals above.")
         return
 
     try:
-        df = pd.read_csv(uploaded)
-        st.success(f"Loaded {len(df)} rows from CSV.")
+        name = (getattr(uploaded, "name", "") or "").lower()
+        if name.endswith(".xlsx") or name.endswith(".xls"):
+            df = pd.read_excel(uploaded)
+            st.success(f"Loaded {len(df)} rows from Excel.")
+        else:
+            df = pd.read_csv(uploaded)
+            st.success(f"Loaded {len(df)} rows from CSV.")
     except Exception as ex:
-        st.error(f"Could not parse CSV: {ex}")
+        st.error(f"Could not parse uploaded file: {ex}")
         return
 
     for spec in specs:

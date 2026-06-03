@@ -47,7 +47,7 @@ class UCBrowser:
     def __init__(
         self,
         demo_excel: Optional[Union[str, bytes, BytesIO]] = None,
-        demo_sheet: Union[int, str] = 0,
+        demo_sheet: Optional[Union[int, str]] = 0,
         force_demo: bool = False,
     ):
         self.spark = None
@@ -110,7 +110,7 @@ class UCBrowser:
         return self.spark.table(full_name).columns
 
     # --------------------- Demo Excel helpers ---------------------
-    def load_demo_excel(self, demo_excel: Union[str, bytes, BytesIO], demo_sheet: Union[int, str] = 0) -> None:
+    def load_demo_excel(self, demo_excel: Union[str, bytes, BytesIO], demo_sheet: Optional[Union[int, str]] = 0) -> None:
         """
         Load demo metadata from Excel.
 
@@ -130,159 +130,121 @@ class UCBrowser:
         else:
             raise TypeError("demo_excel must be a path (str), bytes, or BytesIO")
 
-        df = pd.read_excel(bio, sheet_name=demo_sheet, engine="openpyxl")
-        if df is None or df.empty:
-            self._demo_index = {}
-            return
-
-        df = df.copy()
-        df.columns = [str(c).strip() for c in df.columns]
-
-        # Accept multiple header variants (case-insensitive)
-        colmap = {c.lower(): c for c in df.columns}
-
-        def pick(*names: str) -> Optional[str]:
-            for n in names:
-                if n.lower() in colmap:
-                    return colmap[n.lower()]
-            return None
-
-        c_catalog = pick("CatalogName", "catalogName", "catalog", "catalogueName", "catalogue")
-        c_schema = pick("SchemaName", "schemaName", "schema", "database", "databaseName")
-        c_table = pick("TableName", "tableName", "table")
-        c_cols = pick("ColumnNames", "columns", "columnNames", "column_list")
-
-        # NEW: support multiple column fields like ColumnName1, ColumnName2, ...
-        
-        multi_col_fields = []
-        for c in df.columns:
-            name = str(c).strip()
-            low = name.lower()
-
-            if low in ("columnnames", "columnname", "columns", "column_names","ColumnNames"):
-                continue  # exclude the single-cell list column
-
-            if low.startswith("ColumnNames") or low.startswith("column"):
-                multi_col_fields.append(name)
-
-        # Ensure a stable ordering: Column1, Column2, Column3...
-        def _col_sort_key(colname: str):
-            import re
-            m = re.search(r"(\\d+)$", colname.strip())
-            return (0, int(m.group(1))) if m else (1, colname.lower())
-
-        multi_col_fields = sorted(multi_col_fields, key=_col_sort_key)
-
-        missing = [
-            k for k, v in {
-                "CatalogName": c_catalog,
-                "SchemaName": c_schema,
-                "TableName": c_table,
-                "ColumnNames": c_cols
-            }.items()
-            if v is None
-        ]
-        if missing:
-            raise ValueError(f"Demo Excel missing required columns: {', '.join(missing)}")
-
-        # Normalize values
-        df[c_catalog] = df[c_catalog].astype(str).str.strip()
-        df[c_schema] = df[c_schema].astype(str).str.strip()
-        df[c_table] = df[c_table].astype(str).str.strip()
-        df[c_cols] = df[c_cols].fillna("").astype(str).str.strip()
-
         index: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
 
-        for _, row in df.iterrows():
-            catalog = row[c_catalog]
-            schema = row[c_schema]
-            table = row[c_table]
-            cols = []
+        if demo_sheet is None:
+            sheets = pd.read_excel(bio, sheet_name=None, engine="openpyxl")
+        else:
+            sheets = {str(demo_sheet): pd.read_excel(bio, sheet_name=demo_sheet, engine="openpyxl")}
 
-            # Case 1: Columns provided across multiple Excel columns (ColumnName1..N)
-            if multi_col_fields:
-                for c in multi_col_fields:
-                    v = row.get(c, "")
-                    if v is None:
-                        continue
-                    v = str(v).strip()
-                    if v and v.lower() != "nan":
-                        cols.append(v)
-
-            # Case 2: Fallback to single ColumnNames cell (comma/semicolon/pipe separated)
-            elif c_cols is not None:
-                cols_raw = row.get(c_cols, "")
-                if cols_raw is not None:
-                    raw = str(cols_raw).strip()
-                    if raw and raw.lower() != "nan":
-                        raw = raw.replace("|", ",").replace(";", ",").replace("\n", ",").replace("\r", ",")
-                        # Handle python-list style: ['a','b']
-                        if raw.startswith("[") and raw.endswith("]"):
-                            raw = raw[1:-1].replace("'", "").replace('"', "")
-                        for token in raw.split(","):
-                            t = token.strip()
-                            if t:
-                                cols.append(t)
-
-            # De-duplicate while preserving order
-            seen = set()
-            cols_unique = []
-            for c in cols:
-                if c not in seen:
-                    seen.add(c)
-                    cols_unique.append(c)
-
-            # Get existing list for this table (if any)
-            tbl_dict = index.setdefault(catalog, {}).setdefault(schema, {})
-            existing = tbl_dict.get(table, [])
-
-            # Append new cols and keep unique order
-            seen = set(existing)
-            for c in cols_unique:
-                if c not in seen:
-                    existing.append(c)
-                    seen.add(c)
-
-            tbl_dict[table] = existing
-
-            if not catalog or str(catalog).lower() == "nan":
-                continue
-            if not schema or str(schema).lower() == "nan":
-                continue
-            if not table or str(table).lower() == "nan":
+        for sheet_name, df in sheets.items():
+            if df is None or df.empty:
                 continue
 
-            # Split columns by comma/semicolon/pipe
-            cols = []
-            if cols_raw and str(cols_raw).lower() != "nan":
-                for token in str(cols_raw).replace("|", ",").replace(";", ",").split(","):
-                    t = token.strip()
-                    if t:
-                        cols.append(t)
+            df = df.copy()
+            df.columns = [str(c).strip() for c in df.columns]
 
-            # Ensure unique column names preserving order
-            seen = set()
-            cols_unique = []
-            for c in cols:
-                if c not in seen:
-                    seen.add(c)
-                    cols_unique.append(c)
+            # Accept multiple header variants (case-insensitive)
+            colmap = {c.lower(): c for c in df.columns}
 
-            # ---------- ACCUMULATE columns instead of overwriting ----------
-            tbl_dict = index.setdefault(catalog, {}).setdefault(schema, {})
+            def pick(*names: str) -> Optional[str]:
+                for n in names:
+                    if n.lower() in colmap:
+                        return colmap[n.lower()]
+                return None
 
-            # get existing cols for the table (if any)
-            existing = tbl_dict.get(table, [])
+            c_catalog = pick("CatalogName", "catalogName", "catalog", "catalogueName", "catalogue")
+            c_schema = pick("SchemaName", "schemaName", "schema", "database", "databaseName")
+            c_table = pick("TableName", "tableName", "table")
+            c_cols = pick("ColumnNames", "columns", "columnNames", "column_list")
 
-            # append new columns while preserving order + uniqueness
-            seen = set(existing)
-            for c in cols_unique:
-                if c and c not in seen:
-                    existing.append(c)
-                    seen.add(c)
+            # Support multiple column fields like ColumnName1, ColumnName2, ...
+            multi_col_fields = []
+            for c in df.columns:
+                name = str(c).strip()
+                low = name.lower()
 
-            tbl_dict[table] = existing
-            # --------------------------------------------------------------
+                if low in ("columnnames", "columnname", "columns", "column_names", "columnnames"):
+                    continue
+
+                if low.startswith("columnname") or low.startswith("column"):
+                    multi_col_fields.append(name)
+
+            # Ensure a stable ordering: Column1, Column2, Column3...
+            def _col_sort_key(colname: str):
+                import re
+
+                m = re.search(r"(\d+)$", colname.strip())
+                return (0, int(m.group(1))) if m else (1, colname.lower())
+
+            multi_col_fields = sorted(multi_col_fields, key=_col_sort_key)
+
+            required = {"CatalogName": c_catalog, "SchemaName": c_schema, "TableName": c_table}
+            if not all(required.values()):
+                continue
+
+            # Normalize values
+            df[c_catalog] = df[c_catalog].astype(str).str.strip()
+            df[c_schema] = df[c_schema].astype(str).str.strip()
+            df[c_table] = df[c_table].astype(str).str.strip()
+            if c_cols is not None:
+                df[c_cols] = df[c_cols].fillna("").astype(str).str.strip()
+
+            for _, row in df.iterrows():
+                catalog = row[c_catalog]
+                schema = row[c_schema]
+                table = row[c_table]
+                if not catalog or str(catalog).lower() == "nan":
+                    continue
+                if not schema or str(schema).lower() == "nan":
+                    continue
+                if not table or str(table).lower() == "nan":
+                    continue
+
+                cols = []
+
+                # Case 1: Columns provided across multiple Excel columns (ColumnName1..N)
+                if multi_col_fields:
+                    for c in multi_col_fields:
+                        v = row.get(c, "")
+                        if v is None:
+                            continue
+                        v = str(v).strip()
+                        if v and v.lower() != "nan":
+                            cols.append(v)
+
+                # Case 2: Fallback to single ColumnNames cell (comma/semicolon/pipe separated)
+                elif c_cols is not None:
+                    cols_raw = row.get(c_cols, "")
+                    if cols_raw is not None:
+                        raw = str(cols_raw).strip()
+                        if raw and raw.lower() != "nan":
+                            raw = raw.replace("|", ",").replace(";", ",").replace("\n", ",").replace("\r", ",")
+                            if raw.startswith("[") and raw.endswith("]"):
+                                raw = raw[1:-1].replace("'", "").replace('"', "")
+                            for token in raw.split(","):
+                                t = token.strip()
+                                if t:
+                                    cols.append(t)
+
+                # De-duplicate while preserving order
+                seen = set()
+                cols_unique = []
+                for c in cols:
+                    if c not in seen:
+                        seen.add(c)
+                        cols_unique.append(c)
+
+                tbl_dict = index.setdefault(catalog, {}).setdefault(schema, {})
+                existing = tbl_dict.get(table, [])
+
+                seen = set(existing)
+                for c in cols_unique:
+                    if c and c not in seen:
+                        existing.append(c)
+                        seen.add(c)
+
+                tbl_dict[table] = existing
 
         self._demo_index = index
         self._demo = True

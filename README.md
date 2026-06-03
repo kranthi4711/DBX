@@ -9,6 +9,7 @@
 ## Capabilities
 - Browse Unity Catalog to choose source tables
 - Dropdown-driven transformation builder
+- Built-in demo Excel workbook with sample customers, products, orders, and order_items metadata plus dummy data sheets
 - Diagram view (Source → Transform → Output alias → Target tables)
 - BI Visual Studio page in Streamlit sidebar/pages:
   - Select raw and target tables

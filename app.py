@@ -1,3 +1,5 @@
+import textwrap
+
 import streamlit as st
 from graphviz import Digraph
 
@@ -7,6 +9,7 @@ from ops import OP_REGISTRY, list_operations, resolve_operation
 from codegen import generate_pyspark_code
 from excel_export import export_pipeline_to_excel
 from export_zip import build_export_zip
+from demo_excel import build_default_demo_excel_bytes
 from kpi_visualizations import render_kpi_visual_tab
 
 st.set_page_config(page_title="Databricks Pipeline Designer", layout="wide")
@@ -61,7 +64,7 @@ def _refresh_browser():
             st.session_state.browser = UCBrowser(
                 demo_excel=st.session_state.demo_excel_bytes,
                 force_demo=True,
-                demo_sheet=st.session_state.demo_sheet if st.session_state.demo_sheet is not None else 0,
+                demo_sheet=st.session_state.demo_sheet,
             )
         except TypeError:
             # Backward compatibility: if older uc.py is still being imported
@@ -75,6 +78,66 @@ def _get_browser():
     if st.session_state.browser is None:
         _refresh_browser()
     return st.session_state.browser
+
+
+def _sync_demo_sources(browser: UCBrowser):
+    """
+    In demo mode, populate the source list from the Excel metadata automatically.
+    Each catalog.schema.table combination becomes an available source dataset.
+    """
+    if not (hasattr(browser, "is_demo") and browser.is_demo()):
+        return
+
+    existing_datasets = dict(st.session_state.datasets)
+    existing_dataset_cols = dict(st.session_state.dataset_cols)
+
+    sources = []
+    datasets = {}
+    dataset_cols = {}
+
+    for catalog in browser.catalogs():
+        for schema in browser.schemas(catalog):
+            for table in browser.tables(catalog, schema):
+                full_name = f"{catalog}.{schema}.{table}"
+                alias = table
+
+                suffix = 2
+                while alias in datasets and datasets[alias] != full_name:
+                    alias = f"{table}_{suffix}"
+                    suffix += 1
+
+                sources.append(Source(alias=alias, full_name=full_name))
+                datasets[alias] = full_name
+                try:
+                    dataset_cols[alias] = browser.columns_from_fullname(full_name)
+                except Exception:
+                    dataset_cols[alias] = []
+
+    if sources:
+        st.session_state.sources = sources
+
+        # Preserve derived/intermediate aliases created by steps while refreshing source aliases.
+        merged_datasets = {
+            alias: full_name
+            for alias, full_name in existing_datasets.items()
+            if full_name == "__INTERMEDIATE__"
+        }
+        merged_dataset_cols = {
+            alias: cols
+            for alias, cols in existing_dataset_cols.items()
+            if alias in merged_datasets
+        }
+
+        merged_datasets.update(datasets)
+        merged_dataset_cols.update(dataset_cols)
+
+        st.session_state.datasets = merged_datasets
+        st.session_state.dataset_cols = merged_dataset_cols
+
+
+def _reset_uc_picker_state():
+    for key in ("uc_catalog", "uc_schema", "uc_table", "demo_sheet_picker"):
+        st.session_state.pop(key, None)
 
 
 # =============================================================================
@@ -208,6 +271,16 @@ with st.sidebar:
 
     uploaded = st.file_uploader("Upload Demo UC Excel (.xlsx)", type=["xlsx"])
 
+    builtin_demo_bytes = build_default_demo_excel_bytes()
+    st.download_button(
+        "Download built-in demo Excel",
+        data=builtin_demo_bytes,
+        file_name="demo_uc_sample.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    colA, colB = st.columns(2)
+
     # Sheet picker only if Excel uploaded
     if uploaded:
         try:
@@ -223,25 +296,30 @@ with st.sidebar:
         with colA:
             if st.button("Activate Demo Excel", type="primary"):
                 st.session_state.demo_excel_bytes = uploaded.getvalue()
-                st.session_state.demo_sheet = sheet
-                st.session_state.browser = None  # force recreate
-                st.session_state.uc_catalog = None if "uc_catalog" in st.session_state else None
-                st.session_state.uc_schema = None if "uc_schema" in st.session_state else None
-                st.session_state.uc_table = None if "uc_table" in st.session_state else None
-                st.rerun()
-
-        with colB:
-            if st.button("Disable Demo"):
-                st.session_state.demo_excel_bytes = None
                 st.session_state.demo_sheet = None
                 st.session_state.browser = None  # force recreate
-                st.session_state.uc_catalog = None if "uc_catalog" in st.session_state else None
-                st.session_state.uc_schema = None if "uc_schema" in st.session_state else None
-                st.session_state.uc_table = None if "uc_table" in st.session_state else None
+                _reset_uc_picker_state()
                 st.rerun()
+
+    with colA:
+        if st.button("Use built-in demo Excel", type="secondary"):
+            st.session_state.demo_excel_bytes = builtin_demo_bytes
+            st.session_state.demo_sheet = None
+            st.session_state.browser = None  # force recreate
+            _reset_uc_picker_state()
+            st.rerun()
+
+    with colB:
+        if st.button("Disable Demo"):
+            st.session_state.demo_excel_bytes = None
+            st.session_state.demo_sheet = None
+            st.session_state.browser = None  # force recreate
+            _reset_uc_picker_state()
+            st.rerun()
 
     # Ensure browser exists for mode indicator
     browser = _get_browser()
+    _sync_demo_sources(browser)
 
     if hasattr(browser, "is_demo") and browser.is_demo():
         st.success("Mode: DEMO (Excel-driven)")
@@ -555,11 +633,113 @@ def node_style(kind: str, colorful: bool) -> dict:
     }
     return palette.get(kind, {"fillcolor": "#F1F5F9"})
 
+
+def _short_text(value, limit: int = 80) -> str:
+    text = str(value).replace("\n", " ").strip()
+    return textwrap.shorten(text, width=limit, placeholder="...") if text else ""
+
+
+def _step_logic_label(step: Step) -> str:
+    params = step.params or {}
+    op = step.operation
+
+    if op == "Filter":
+        column = params.get("column", "")
+        operator = params.get("operator", "")
+        value = params.get("value")
+        if operator in {"IS NULL", "IS NOT NULL"}:
+            return _short_text(f"{column} {operator}")
+        if operator in {"IN", "NOT IN"}:
+            values = [part.strip() for part in str(value or "").split(",") if part.strip()]
+            joined = ", ".join(values[:4])
+            if len(values) > 4:
+                joined += ", ..."
+            return _short_text(f"{column} {operator} ({joined})")
+        return _short_text(f"{column} {operator} {value}")
+
+    if op == "SQL Where":
+        return _short_text(params.get("condition", ""))
+
+    if op == "Join":
+        how = params.get("how", "inner")
+        key_mapping = params.get("key_mapping") or []
+        keys = params.get("keys") or []
+        if key_mapping:
+            pairs = [f"{m.get('s1')}={m.get('s2')}" for m in key_mapping if m.get("s1") and m.get("s2")]
+            return _short_text(f"{how} on {', '.join(pairs)}")
+        if keys:
+            return _short_text(f"{how} on {', '.join(keys)}")
+        return _short_text(how)
+
+    if op == "Select Columns":
+        columns = params.get("columns") or []
+        return _short_text(", ".join(columns))
+
+    if op == "Aggregate":
+        group_by = params.get("group_by") or []
+        aggs = params.get("aggs") or []
+        agg_parts = [f"{a.get('func')}({a.get('column')}) as {a.get('alias')}" for a in aggs if a.get("column") and a.get("func")]
+        summary = []
+        if group_by:
+            summary.append(f"group_by: {', '.join(group_by)}")
+        if agg_parts:
+            summary.append(f"aggs: {', '.join(agg_parts)}")
+        return _short_text(" | ".join(summary))
+
+    if op == "Create/Update Column":
+        new_column = params.get("new_column", "")
+        mode = params.get("expr_mode", "")
+        if mode == "Simple":
+            return _short_text(f"{new_column} = {params.get('simple_op', 'copy')}({params.get('source_col', '')})")
+        if mode == "Concat":
+            return _short_text(f"{new_column} = concat({', '.join(params.get('concat_cols') or [])})")
+        if mode == "Math":
+            return _short_text(f"{new_column} = {params.get('left_col', '')} {params.get('math_op', '+')} {params.get('right_value', '')}")
+        if mode == "Case When":
+            return _short_text(
+                f"{new_column} = CASE {params.get('when_col', '')} {params.get('when_op', '')} {params.get('when_val', '')} THEN {params.get('then_val', '')} ELSE {params.get('else_val', '')}"
+            )
+        if mode == "SQL Expression":
+            return _short_text(params.get("sql_expr", ""))
+        return _short_text(new_column)
+
+    if op == "Rename Columns":
+        mappings = params.get("mappings") or []
+        return _short_text(", ".join([f"{m.get('from')}→{m.get('to')}" for m in mappings if m.get("from") and m.get("to")]))
+
+    if op == "Drop Columns":
+        return _short_text(f"drop {', '.join(params.get('columns') or [])}")
+
+    if op == "Union":
+        bits = []
+        if params.get("by_name"):
+            bits.append("by name")
+        if params.get("allow_missing_columns"):
+            bits.append("allow missing")
+        return _short_text(", ".join(bits))
+
+    if op == "Limit":
+        return _short_text(f"rows: {params.get('n', '')}")
+
+    if op == "Order By":
+        columns = params.get("columns") or []
+        direction = params.get("direction", "asc")
+        return _short_text(f"{', '.join(columns)} ({direction})")
+
+    if op == "Sample":
+        return _short_text(f"fraction={params.get('fraction', '')}, seed={params.get('seed', '')}")
+
+    return ""
+
 with t_graph:
     st.subheader("Operational Diagram")
 
     # ✅ Toggle: Colorful vs Black & White
-    colorful = st.toggle("Colorful diagram", value=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        colorful = st.toggle("Colorful diagram", value=True)
+    with c2:
+        show_logic = st.toggle("Show transformation logic", value=False)
 
     if not st.session_state.pipeline.steps:
         st.info("Add sources and steps to view the diagram.")
@@ -577,7 +757,11 @@ with t_graph:
             op_node = f"op{idx}"
 
             # operation node
-            dot.node(op_node, label=step.operation, **node_style("op", colorful))
+            op_label = step.operation
+            logic_label = _step_logic_label(step) if show_logic else ""
+            if logic_label:
+                op_label = f"{op_label}\n{logic_label}"
+            dot.node(op_node, label=op_label, **node_style("op", colorful))
 
             # edges from inputs to operation
             dot.edge(step.input1, op_node)
